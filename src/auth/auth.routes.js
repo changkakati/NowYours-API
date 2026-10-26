@@ -7,6 +7,8 @@ import {
   me,
   refresh,
   logout,
+  verifyEmail,
+  resendVerification,
 } from "./auth.controller.js";
 
 import {
@@ -18,6 +20,10 @@ const router = Router();
 
 router.post("/register", register);
 router.post("/login", login);
+
+router.post("/verify-email", verifyEmail);
+router.post("/resend-verification", resendVerification);
+
 router.post("/refresh", refresh);
 router.post("/logout", logout);
 

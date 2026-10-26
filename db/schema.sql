@@ -7,7 +7,7 @@ CREATE TABLE users (
     is_admin BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
+, is_email_verified BOOLEAN NOT NULL DEFAULT FALSE);
 CREATE TABLE refresh_tokens (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -22,7 +22,18 @@ CREATE INDEX idx_refresh_tokens_user_id
 ON refresh_tokens(user_id);
 CREATE INDEX idx_refresh_tokens_family_id
 ON refresh_tokens(family_id);
+CREATE TABLE email_verification_tokens (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL UNIQUE,
+    expires_at TEXT NOT NULL,
+    used_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_email_verification_tokens_user_id
+ON email_verification_tokens(user_id);
 -- Dbmate schema migrations
 INSERT INTO "schema_migrations" (version) VALUES
   ('20261026063250'),
-  ('20261026071607');
+  ('20261026071607'),
+  ('20261026075615');

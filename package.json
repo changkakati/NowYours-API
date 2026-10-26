@@ -7,8 +7,7 @@
     "dev": "nodemon src/server.js",
     "migration:create": "dbmate new",
     "migration:up": "dbmate up",
-    "migration:fresh": "dbmate drop && dbmate up",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "migration:fresh": "dbmate drop && dbmate up"
   },
   "keywords": [],
   "author": "",
@@ -22,7 +21,8 @@
     "cors": "^2.8.6",
     "dotenv": "^18.0.9",
     "express": "^5.3.0",
-    "jsonwebtoken": "^9.0.3"
+    "jsonwebtoken": "^9.0.3",
+    "resend": "^6.34.1"
   },
   "devDependencies": {
     "dbmate": "^2.37.0",

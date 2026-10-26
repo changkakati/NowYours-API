@@ -2,6 +2,10 @@
 import jwt from "jsonwebtoken";
 import { query } from "../config/database.js";
 
+// --------------------------------------------------
+// Authenticate user using JWT access token
+// --------------------------------------------------
+
 export async function authenticateToken(req, res, next) {
   const authorization = req.headers.authorization;
 
@@ -36,17 +40,22 @@ export async function authenticateToken(req, res, next) {
       });
     }
 
-    throw error;
+    return next(error);
   }
 
+  // Make sure the JWT contains a valid user ID.
   if (typeof payload.sub !== "string") {
     return res.status(401).json({
       message: "Invalid token",
     });
   }
 
+  // Fetch the current user from the database.
   const users = await query(
-    "SELECT id, is_admin FROM users WHERE id = ? LIMIT 1",
+    `SELECT id, is_admin, is_email_verified
+     FROM users
+     WHERE id = ?
+     LIMIT 1`,
     [payload.sub]
   );
 
@@ -56,16 +65,40 @@ export async function authenticateToken(req, res, next) {
     });
   }
 
+  const user = users[0];
+
+  // Normalize SQLite boolean values.
+  const isEmailVerified =
+    user.is_email_verified === true ||
+    user.is_email_verified === 1 ||
+    user.is_email_verified === "1";
+
+  const isAdmin =
+    user.is_admin === true ||
+    user.is_admin === 1 ||
+    user.is_admin === "1";
+
+  // Block access until the email is verified.
+  if (!isEmailVerified) {
+    return res.status(403).json({
+      message: "Please verify your email before accessing this resource.",
+      emailVerificationRequired: true,
+    });
+  }
+
+  // Attach authenticated user to the request.
   req.user = {
-    id: users[0].id,
-    is_admin:
-      users[0].is_admin === true ||
-      users[0].is_admin === 1 ||
-      users[0].is_admin === "1",
+    id: user.id,
+    is_admin: isAdmin,
+    is_email_verified: isEmailVerified,
   };
 
-  next();
+  return next();
 }
+
+// --------------------------------------------------
+// Restrict routes to administrators
+// --------------------------------------------------
 
 export function requireAdmin(req, res, next) {
   if (!req.user?.is_admin) {
@@ -74,5 +107,5 @@ export function requireAdmin(req, res, next) {
     });
   }
 
-  next();
+  return next();
 }

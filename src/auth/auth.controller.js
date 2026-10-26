@@ -12,23 +12,38 @@ import {
   withTransaction,
 } from "../config/database.js";
 
+import {
+  sendVerificationEmail,
+} from "../email/resend.js";
+
 const ACCESS_TOKEN_EXPIRY =
   process.env.JWT_EXPIRES_IN || "15m";
 
 const REFRESH_TOKEN_DAYS = 7;
+const VERIFICATION_TOKEN_MINUTES = 30;
 
-function hashRefreshToken(token) {
-  return createHash("sha256")
-    .update(token)
-    .digest("hex");
+// --------------------------------------------------
+// Helpers
+// --------------------------------------------------
+
+function hashToken(token) {
+  return createHash("sha256").update(token).digest("hex");
 }
 
-function createAccessToken(user) {
+function isVerified(value) {
+  return (
+    value === true ||
+    value === 1 ||
+    value === "1"
+  );
+}
+
+function createAccessToken(userId) {
   return jwt.sign(
     {},
     process.env.JWT_SECRET,
     {
-      subject: user.id,
+      subject: userId,
       expiresIn: ACCESS_TOKEN_EXPIRY,
       algorithm: "HS256",
     }
@@ -41,8 +56,7 @@ function createRefreshToken() {
 
 function refreshExpiry() {
   return new Date(
-    Date.now() +
-      REFRESH_TOKEN_DAYS * 24 * 60 * 60 * 1000
+    Date.now() + REFRESH_TOKEN_DAYS * 24 * 60 * 60 * 1000
   ).toISOString();
 }
 
@@ -51,34 +65,9 @@ function serializeUser(user) {
     id: user.id,
     name: user.name,
     email: user.email,
-    is_admin:
-      user.is_admin === true ||
-      user.is_admin === 1 ||
-      user.is_admin === "1",
+    is_admin: isVerified(user.is_admin),
+    is_email_verified: isVerified(user.is_email_verified),
     created_at: user.created_at,
-  };
-}
-
-async function createSession(userId) {
-  const refreshToken = createRefreshToken();
-  const tokenHash = hashRefreshToken(refreshToken);
-
-  await query(
-    `INSERT INTO refresh_tokens
-      (id, user_id, family_id, token_hash, expires_at)
-     VALUES (?, ?, ?, ?, ?)`,
-    [
-      randomUUID(),
-      userId,
-      randomUUID(),
-      tokenHash,
-      refreshExpiry(),
-    ]
-  );
-
-  return {
-    accessToken: createAccessToken({ id: userId }),
-    refreshToken,
   };
 }
 
@@ -100,7 +89,76 @@ function sendSession(
   });
 }
 
+async function createSession(userId) {
+  const refreshToken = createRefreshToken();
+  const tokenHash = hashToken(refreshToken);
+
+  await query(
+    `INSERT INTO refresh_tokens
+      (id, user_id, family_id, token_hash, expires_at)
+     VALUES (?, ?, ?, ?, ?)`,
+    [
+      randomUUID(),
+      userId,
+      randomUUID(),
+      tokenHash,
+      refreshExpiry(),
+    ]
+  );
+
+  return {
+    accessToken: createAccessToken(userId),
+    refreshToken,
+  };
+}
+
+// --------------------------------------------------
+// Email verification helpers
+// --------------------------------------------------
+
+async function issueVerificationEmail(user) {
+  // Generate a secure, single-use token.
+  const token = randomBytes(32).toString("base64url");
+  const tokenHash = hashToken(token);
+
+  const expiresAt = new Date(
+    Date.now() + VERIFICATION_TOKEN_MINUTES * 60 * 1000
+  ).toISOString();
+
+  // Invalidate previous outstanding verification tokens.
+  await query(
+    `UPDATE email_verification_tokens
+     SET used_at = CURRENT_TIMESTAMP
+     WHERE user_id = ?
+       AND used_at IS NULL`,
+    [user.id]
+  );
+
+  // Store only the hash, never the raw token.
+  await query(
+    `INSERT INTO email_verification_tokens
+      (id, user_id, token_hash, expires_at)
+     VALUES (?, ?, ?, ?)`,
+    [
+      randomUUID(),
+      user.id,
+      tokenHash,
+      expiresAt,
+    ]
+  );
+
+  // Send the raw token only through the verification email.
+  await sendVerificationEmail({
+    email: user.email,
+    name: user.name,
+    token,
+  });
+}
+
+// --------------------------------------------------
 // POST /api/auth/register
+// --------------------------------------------------
+
 export async function register(req, res) {
   const { name, email, password } = req.body ?? {};
 
@@ -156,25 +214,19 @@ export async function register(req, res) {
   const id = randomUUID();
   const passwordHash = await bcrypt.hash(password, 12);
 
+  let user;
+
   try {
     const created = await query(
       `INSERT INTO users
         (id, name, email, password_hash, is_admin)
        VALUES (?, ?, ?, ?, FALSE)
-       RETURNING id, name, email, is_admin, created_at`,
+       RETURNING id, name, email, is_admin,
+                 is_email_verified, created_at`,
       [id, cleanName, cleanEmail, passwordHash]
     );
 
-    const user = created[0];
-    const tokens = await createSession(user.id);
-
-    return sendSession(
-      res,
-      user,
-      tokens,
-      201,
-      "Account created successfully"
-    );
+    user = created[0];
   } catch (error) {
     if (
       error.code === "SQLITE_CONSTRAINT_UNIQUE" ||
@@ -188,9 +240,166 @@ export async function register(req, res) {
 
     throw error;
   }
+
+  // Account exists, but no session is issued until verification.
+  try {
+    await issueVerificationEmail(user);
+  } catch (error) {
+    console.error(
+      "Verification email delivery failed:",
+      error.message
+    );
+
+    return res.status(503).json({
+      message:
+        "Your account was created, but the verification email could not be sent. Please request another email.",
+      email: user.email,
+      emailVerificationRequired: true,
+    });
+  }
+
+  return res.status(201).json({
+    message:
+      "Account created. Please verify your email before logging in.",
+    email: user.email,
+    emailVerificationRequired: true,
+  });
 }
 
+// --------------------------------------------------
+// POST /api/auth/verify-email
+// --------------------------------------------------
+
+export async function verifyEmail(req, res) {
+  const { token } = req.body ?? {};
+
+  if (
+    typeof token !== "string" ||
+    token.length < 20 ||
+    token.length > 200
+  ) {
+    return res.status(400).json({
+      message: "A valid verification token is required.",
+    });
+  }
+
+  const tokenHash = hashToken(token);
+
+  const outcome = await withTransaction(async (txQuery) => {
+    const records = await txQuery(
+      `SELECT id, user_id, expires_at, used_at
+       FROM email_verification_tokens
+       WHERE token_hash = ?
+       LIMIT 1`,
+      [tokenHash]
+    );
+
+    const record = records[0];
+
+    if (!record || record.used_at) {
+      return { error: "invalid" };
+    }
+
+    if (Date.parse(record.expires_at) <= Date.now()) {
+      await txQuery(
+        `UPDATE email_verification_tokens
+         SET used_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND used_at IS NULL`,
+        [record.id]
+      );
+
+      return { error: "expired" };
+    }
+
+    // Consume the token once only.
+    const consumed = await txQuery(
+      `UPDATE email_verification_tokens
+       SET used_at = CURRENT_TIMESTAMP
+       WHERE id = ?
+         AND used_at IS NULL
+       RETURNING id`,
+      [record.id]
+    );
+
+    if (consumed.length === 0) {
+      return { error: "invalid" };
+    }
+
+    await txQuery(
+      `UPDATE users
+       SET is_email_verified = TRUE,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [record.user_id]
+    );
+
+    return { success: true };
+  });
+
+  if (outcome.error) {
+    return res.status(400).json({
+      message:
+        outcome.error === "expired"
+          ? "This verification link has expired. Please request another."
+          : "This verification link is invalid or has already been used.",
+    });
+  }
+
+  return res.json({
+    message:
+      "Email verified successfully. You can now log in.",
+  });
+}
+
+// --------------------------------------------------
+// POST /api/auth/resend-verification
+// --------------------------------------------------
+
+export async function resendVerification(req, res) {
+  const { email } = req.body ?? {};
+
+  if (
+    typeof email !== "string" ||
+    email.length > 254 ||
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
+  ) {
+    return res.status(400).json({
+      message: "Enter a valid email address.",
+    });
+  }
+
+  const users = await query(
+    `SELECT id, name, email, is_email_verified
+     FROM users
+     WHERE email = ?
+     LIMIT 1`,
+    [email.trim().toLowerCase()]
+  );
+
+  const user = users[0];
+
+  // Use the same response whether or not the account exists.
+  if (user && !isVerified(user.is_email_verified)) {
+    try {
+      await issueVerificationEmail(user);
+    } catch (error) {
+      console.error(
+        "Resend verification failed:",
+        error.message
+      );
+    }
+  }
+
+  return res.json({
+    message:
+      "If an unverified account exists for this email, a verification email will be sent.",
+  });
+}
+
+// --------------------------------------------------
 // POST /api/auth/login
+// --------------------------------------------------
+
 export async function login(req, res) {
   const { email, password } = req.body ?? {};
 
@@ -205,7 +414,7 @@ export async function login(req, res) {
 
   const users = await query(
     `SELECT id, name, email, password_hash,
-            is_admin, created_at
+            is_admin, is_email_verified, created_at
      FROM users
      WHERE email = ?
      LIMIT 1`,
@@ -223,6 +432,13 @@ export async function login(req, res) {
     });
   }
 
+  if (!isVerified(user.is_email_verified)) {
+    return res.status(403).json({
+      message: "Please verify your email before logging in.",
+      emailVerificationRequired: true,
+    });
+  }
+
   const tokens = await createSession(user.id);
 
   return sendSession(
@@ -234,10 +450,14 @@ export async function login(req, res) {
   );
 }
 
+// --------------------------------------------------
 // GET /api/auth/me
+// --------------------------------------------------
+
 export async function me(req, res) {
   const users = await query(
-    `SELECT id, name, email, is_admin, created_at
+    `SELECT id, name, email, is_admin,
+            is_email_verified, created_at
      FROM users
      WHERE id = ?
      LIMIT 1`,
@@ -255,7 +475,10 @@ export async function me(req, res) {
   });
 }
 
+// --------------------------------------------------
 // POST /api/auth/refresh
+// --------------------------------------------------
+
 export async function refresh(req, res) {
   const { refreshToken } = req.body ?? {};
 
@@ -268,7 +491,7 @@ export async function refresh(req, res) {
     });
   }
 
-  const tokenHash = hashRefreshToken(refreshToken);
+  const tokenHash = hashToken(refreshToken);
 
   const outcome = await withTransaction(async (txQuery) => {
     const tokens = await txQuery(
@@ -286,7 +509,7 @@ export async function refresh(req, res) {
       return { error: "invalid" };
     }
 
-    // Reuse of a rotated token revokes its whole family.
+    // Reuse of an old token revokes its whole family.
     if (stored.revoked_at) {
       await txQuery(
         `UPDATE refresh_tokens
@@ -311,7 +534,8 @@ export async function refresh(req, res) {
     }
 
     const users = await txQuery(
-      `SELECT id, name, email, is_admin, created_at
+      `SELECT id, name, email, is_admin,
+              is_email_verified, created_at
        FROM users
        WHERE id = ?
        LIMIT 1`,
@@ -329,16 +553,31 @@ export async function refresh(req, res) {
       return { error: "invalid" };
     }
 
-    const nextRefreshToken = createRefreshToken();
-    const nextHash = hashRefreshToken(nextRefreshToken);
+    const user = users[0];
 
-    // RETURNING id is essential: our query helper returns rows,
-    // not the number of rows changed by an UPDATE.
+    // Do not issue new tokens for an unverified account.
+    if (!isVerified(user.is_email_verified)) {
+      await txQuery(
+        `UPDATE refresh_tokens
+         SET revoked_at =
+           COALESCE(revoked_at, CURRENT_TIMESTAMP)
+         WHERE family_id = ?`,
+        [stored.family_id]
+      );
+
+      return { error: "unverified" };
+    }
+
+    const nextRefreshToken = createRefreshToken();
+    const nextHash = hashToken(nextRefreshToken);
+
+    // RETURNING id lets us check whether the token was rotated.
     const updated = await txQuery(
       `UPDATE refresh_tokens
        SET revoked_at = CURRENT_TIMESTAMP,
            replaced_by_hash = ?
-       WHERE id = ? AND revoked_at IS NULL
+       WHERE id = ?
+         AND revoked_at IS NULL
        RETURNING id`,
       [nextHash, stored.id]
     );
@@ -361,7 +600,7 @@ export async function refresh(req, res) {
     );
 
     return {
-      user: users[0],
+      user,
       refreshToken: nextRefreshToken,
     };
   });
@@ -377,9 +616,7 @@ export async function refresh(req, res) {
     res,
     outcome.user,
     {
-      accessToken: createAccessToken({
-        id: outcome.user.id,
-      }),
+      accessToken: createAccessToken(outcome.user.id),
       refreshToken: outcome.refreshToken,
     },
     200,
@@ -387,7 +624,10 @@ export async function refresh(req, res) {
   );
 }
 
+// --------------------------------------------------
 // POST /api/auth/logout
+// --------------------------------------------------
+
 export async function logout(req, res) {
   const { refreshToken } = req.body ?? {};
 
@@ -400,7 +640,7 @@ export async function logout(req, res) {
        SET revoked_at = CURRENT_TIMESTAMP
        WHERE token_hash = ?
          AND revoked_at IS NULL`,
-      [hashRefreshToken(refreshToken)]
+      [hashToken(refreshToken)]
     );
   }
 
