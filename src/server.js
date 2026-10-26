@@ -10,7 +10,7 @@ if (
   throw new Error("JWT_SECRET must contain at least 32 bytes");
 }
 
-const port = Number(process.env.PORT) || 3000;
+const port = Number(process.env.PORT) || 3001;
 
 const server = app.listen(port, () => {
   console.log(`API running at http://localhost:${port}`);

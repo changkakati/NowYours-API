@@ -7,7 +7,7 @@ CREATE TABLE users (
     is_admin BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-, is_email_verified BOOLEAN NOT NULL DEFAULT FALSE);
+, is_email_verified BOOLEAN NOT NULL DEFAULT FALSE, google_sub TEXT);
 CREATE TABLE refresh_tokens (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -42,9 +42,12 @@ CREATE TABLE password_reset_tokens (
 );
 CREATE INDEX idx_password_reset_tokens_user_id
 ON password_reset_tokens(user_id);
+CREATE UNIQUE INDEX idx_users_google_sub
+ON users(google_sub);
 -- Dbmate schema migrations
 INSERT INTO "schema_migrations" (version) VALUES
   ('20261026063250'),
   ('20261026071607'),
   ('20261026075615'),
-  ('20261026081852');
+  ('20261026081852'),
+  ('20261026084327');

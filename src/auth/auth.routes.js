@@ -11,6 +11,7 @@ import {
   resendVerification,
   forgotPassword,
   resetPassword,
+  googleAuth,
 } from "./auth.controller.js";
 
 import {
@@ -27,6 +28,8 @@ router.post("/verify-email", verifyEmail);
 router.post("/resend-verification", resendVerification);
 router.post("/forgot-password", forgotPassword);
 router.post("/reset-password", resetPassword);
+
+router.post("/google", googleAuth);
 
 router.post("/refresh", refresh);
 router.post("/logout", logout);

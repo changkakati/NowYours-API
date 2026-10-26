@@ -20,11 +20,15 @@ import {
   sendPasswordResetEmail,
 } from "../email/resend.js";
 
+import { OAuth2Client } from "google-auth-library";
+
 const ACCESS_TOKEN_EXPIRY =
   process.env.JWT_EXPIRES_IN || "15m";
 
 const REFRESH_TOKEN_DAYS = 7;
 const VERIFICATION_TOKEN_MINUTES = 30;
+
+const googleClient = new OAuth2Client();
 
 // --------------------------------------------------
 // Helpers
@@ -274,6 +278,7 @@ export async function register(req, res) {
 // POST /api/auth/verify-email
 // --------------------------------------------------
 
+
 export async function verifyEmail(req, res) {
   const { token } = req.body ?? {};
 
@@ -289,6 +294,7 @@ export async function verifyEmail(req, res) {
 
   const tokenHash = hashToken(token);
 
+  // Validate and consume the verification token atomically.
   const outcome = await withTransaction(async (txQuery) => {
     const records = await txQuery(
       `SELECT id, user_id, expires_at, used_at
@@ -315,7 +321,6 @@ export async function verifyEmail(req, res) {
       return { error: "expired" };
     }
 
-    // Consume the token once only.
     const consumed = await txQuery(
       `UPDATE email_verification_tokens
        SET used_at = CURRENT_TIMESTAMP
@@ -337,7 +342,10 @@ export async function verifyEmail(req, res) {
       [record.user_id]
     );
 
-    return { success: true };
+    return {
+      success: true,
+      userId: record.user_id,
+    };
   });
 
   if (outcome.error) {
@@ -349,10 +357,34 @@ export async function verifyEmail(req, res) {
     });
   }
 
-  return res.json({
-    message:
-      "Email verified successfully. You can now log in.",
-  });
+  // Fetch the verified user's profile.
+  const users = await query(
+    `SELECT id, name, email, is_admin,
+            is_email_verified, created_at
+     FROM users
+     WHERE id = ?
+     LIMIT 1`,
+    [outcome.userId]
+  );
+
+  if (!users.length) {
+    return res.status(401).json({
+      message: "User account no longer exists.",
+    });
+  }
+
+  const user = users[0];
+
+  // Automatically log the user in.
+  const tokens = await createSession(user.id);
+
+  return sendSession(
+    res,
+    user,
+    tokens,
+    200,
+    "Email verified successfully. You are now logged in."
+  );
 }
 
 // --------------------------------------------------
@@ -873,4 +905,186 @@ export async function resetPassword(req, res) {
     message:
       "Password reset successfully. Please log in with your new password.",
   });
+}
+
+// POST /api/auth/google
+export async function googleAuth(req, res) {
+  const { credential } = req.body ?? {};
+
+  if (
+    typeof credential !== "string" ||
+    credential.length > 10000
+  ) {
+    return res.status(400).json({
+      message: "A valid Google credential is required.",
+    });
+  }
+
+  if (!process.env.GOOGLE_CLIENT_ID) {
+    console.error("GOOGLE_CLIENT_ID is not configured");
+
+    return res.status(500).json({
+      message: "Google authentication is not configured.",
+    });
+  }
+
+  let payload;
+
+  try {
+    const ticket = await googleClient.verifyIdToken({
+      idToken: credential,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+
+    payload = ticket.getPayload();
+  } catch {
+    return res.status(401).json({
+      message: "Invalid or expired Google credential.",
+    });
+  }
+
+  // Only accept a verified Google identity with the required fields.
+  if (
+    !payload ||
+    typeof payload.sub !== "string" ||
+    typeof payload.email !== "string" ||
+    payload.email_verified !== true
+  ) {
+    return res.status(401).json({
+      message: "Google account email could not be verified.",
+    });
+  }
+
+  const googleSub = payload.sub;
+  const email = payload.email.trim().toLowerCase();
+  const name =
+    typeof payload.name === "string" && payload.name.trim()
+      ? payload.name.trim().slice(0, 100)
+      : email.split("@")[0].slice(0, 100);
+
+  // Gmail addresses and Google Workspace accounts are
+  // authoritative for their verified Google email addresses.
+  const isAuthoritativeEmail =
+    email.endsWith("@gmail.com") ||
+    typeof payload.hd === "string";
+
+  try {
+    // 1. Returning Google user: log in by Google's stable ID.
+    const googleUsers = await query(
+      `SELECT id, name, email, is_admin,
+              is_email_verified, created_at
+       FROM users
+       WHERE google_sub = ?
+       LIMIT 1`,
+      [googleSub]
+    );
+
+    let user = googleUsers[0];
+
+    if (!user) {
+      // 2. Check whether this email already belongs to an account.
+      const existingUsers = await query(
+        `SELECT id, name, email, is_admin,
+                is_email_verified, google_sub, created_at
+         FROM users
+         WHERE email = ?
+         LIMIT 1`,
+        [email]
+      );
+
+      const existingUser = existingUsers[0];
+
+      if (existingUser) {
+        // Don't silently link an account with an unrelated
+        // or non-authoritative email identity.
+        if (!isAuthoritativeEmail) {
+          return res.status(409).json({
+            message:
+              "An account with this email already exists. Log in using your existing method before linking Google.",
+          });
+        }
+
+        // Don't overwrite an account already linked to another
+        // Google identity.
+        if (
+          existingUser.google_sub &&
+          existingUser.google_sub !== googleSub
+        ) {
+          return res.status(409).json({
+            message:
+              "This email is already linked to another Google account.",
+          });
+        }
+
+        // Link the verified Google identity to the existing account.
+        await query(
+          `UPDATE users
+           SET google_sub = ?,
+               is_email_verified = TRUE,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE id = ?`,
+          [googleSub, existingUser.id]
+        );
+
+        const updatedUsers = await query(
+          `SELECT id, name, email, is_admin,
+                  is_email_verified, created_at
+           FROM users
+           WHERE id = ?
+           LIMIT 1`,
+          [existingUser.id]
+        );
+
+        user = updatedUsers[0];
+      } else {
+        // 3. New Google user: create a local account.
+        // A random password hash satisfies the existing NOT NULL
+        // schema; the user cannot know this generated password.
+        const randomPassword = randomBytes(32).toString("hex");
+        const passwordHash = await bcrypt.hash(randomPassword, 12);
+        const id = randomUUID();
+
+        const created = await query(
+          `INSERT INTO users
+            (id, name, email, password_hash, is_admin,
+             is_email_verified, google_sub)
+           VALUES (?, ?, ?, ?, FALSE, TRUE, ?)
+           RETURNING id, name, email, is_admin,
+                     is_email_verified, created_at`,
+          [id, name, email, passwordHash, googleSub]
+        );
+
+        user = created[0];
+      }
+    }
+
+    // 4. Issue your normal NowYours access and refresh tokens.
+    const tokens = await createSession(user.id);
+
+    return sendSession(
+      res,
+      user,
+      tokens,
+      200,
+      "Google authentication successful"
+    );
+  } catch (error) {
+    // A concurrent request could create or link the same account.
+    if (
+      error.code === "SQLITE_CONSTRAINT_UNIQUE" ||
+      error.code === "SQLITE_CONSTRAINT_PRIMARYKEY" ||
+      error.code === "23505"
+    ) {
+      return res.status(409).json({
+        message:
+          "This account was created or linked by another request. Please try signing in again.",
+      });
+    }
+
+    console.error("Google authentication failed:", error.message);
+
+    return res.status(500).json({
+      message: "Google authentication failed. Please try again.",
+    });
+  }
 }

@@ -1,4 +1,4 @@
 authentication - jwt (Access & Refresh Token)
-- Register - username, email, password
-- Login - email, password
+- Register - username, email, password, verify email, register with Oauth google
+- Login - email, password, Forgot password, login with Oauth google
 - logout
