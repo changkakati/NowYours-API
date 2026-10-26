@@ -1,0 +1,4 @@
+authentication - jwt (Access & Refresh Token)
+- Register - username, email, password
+- Login - email, password
+- logout
