@@ -108,6 +108,58 @@ CREATE TABLE listing_images (
 );
 CREATE INDEX idx_listing_images_listing_id
 ON listing_images(listing_id);
+CREATE TABLE conversations (
+    id TEXT PRIMARY KEY,
+    listing_id TEXT NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+    buyer_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    seller_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (buyer_id <> seller_id),
+    UNIQUE (listing_id, buyer_id, seller_id)
+);
+CREATE INDEX idx_conversations_buyer_updated
+ON conversations(buyer_id, updated_at);
+CREATE INDEX idx_conversations_seller_updated
+ON conversations(seller_id, updated_at);
+CREATE TABLE chat_messages (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL
+        REFERENCES conversations(id) ON DELETE CASCADE,
+    sender_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    body TEXT NOT NULL CHECK (length(trim(body)) BETWEEN 1 AND 5000),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    read_at TEXT
+);
+CREATE INDEX idx_chat_messages_conversation_created
+ON chat_messages(conversation_id, created_at);
+CREATE INDEX idx_chat_messages_unread
+ON chat_messages(conversation_id, sender_id, read_at);
+CREATE TABLE notifications (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    actor_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+    type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    link TEXT,
+    conversation_id TEXT REFERENCES conversations(id) ON DELETE CASCADE,
+    read_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_notifications_user_created
+ON notifications(user_id, created_at);
+CREATE INDEX idx_notifications_user_unread
+ON notifications(user_id, read_at);
+CREATE TABLE wishlists (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    listing_id TEXT NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (user_id, listing_id)
+);
+CREATE INDEX idx_wishlists_user_created
+ON wishlists(user_id, created_at);
 -- Dbmate schema migrations
 INSERT INTO "schema_migrations" (version) VALUES
   ('20261026063250'),
@@ -115,4 +167,7 @@ INSERT INTO "schema_migrations" (version) VALUES
   ('20261026075615'),
   ('20261026081852'),
   ('20261026084327'),
-  ('20261026115335');
+  ('20261026115335'),
+  ('20261026141510'),
+  ('20261026143522'),
+  ('20261026145212');

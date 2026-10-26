@@ -3,6 +3,9 @@ import cors from "cors";
 
 import authRoutes from "./auth/auth.routes.js";
 import listingRoutes from "./listings/listings.routes.js";
+import chatRoutes from "./chat/chat.routes.js";
+import notificationRoutes from "./notifications/notifications.routes.js";
+import wishlistRoutes from "./wishlist/wishlist.routes.js";
 
 const app = express();
 
@@ -16,6 +19,9 @@ app.get("/api/health", (req, res) => {
 
 app.use("/api/auth", authRoutes);
 app.use("/api/listings", listingRoutes);
+app.use("/api/chat", chatRoutes);
+app.use("/api/notifications", notificationRoutes);
+app.use("/api/wishlist", wishlistRoutes);
 
 app.use((req, res) => {
   res.status(404).json({
