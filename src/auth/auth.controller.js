@@ -16,6 +16,10 @@ import {
   sendVerificationEmail,
 } from "../email/resend.js";
 
+import {
+  sendPasswordResetEmail,
+} from "../email/resend.js";
+
 const ACCESS_TOKEN_EXPIRY =
   process.env.JWT_EXPIRES_IN || "15m";
 
@@ -646,5 +650,227 @@ export async function logout(req, res) {
 
   return res.json({
     message: "Logged out successfully",
+  });
+}
+
+
+const PASSWORD_RESET_MINUTES = 30;
+
+// POST /api/auth/forgot-password
+export async function forgotPassword(req, res) {
+  const { email } = req.body ?? {};
+
+  if (
+    typeof email !== "string" ||
+    email.trim().length > 254 ||
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
+  ) {
+    return res.status(400).json({
+      message: "Enter a valid email address.",
+    });
+  }
+
+  const users = await query(
+    `SELECT id, name, email, is_email_verified
+     FROM users
+     WHERE email = ?
+     LIMIT 1`,
+    [email.trim().toLowerCase()]
+  );
+
+  const user = users[0];
+
+  // Only send password resets to verified accounts.
+  // Keep the public response identical for all addresses.
+  if (
+    user &&
+    isVerified(user.is_email_verified)
+  ) {
+    const token = randomBytes(32).toString("base64url");
+    const tokenHash = hashToken(token);
+
+    const expiresAt = new Date(
+      Date.now() + PASSWORD_RESET_MINUTES * 60 * 1000
+    ).toISOString();
+
+    await query(
+      `UPDATE password_reset_tokens
+       SET used_at = CURRENT_TIMESTAMP
+       WHERE user_id = ?
+         AND used_at IS NULL`,
+      [user.id]
+    );
+
+    await query(
+      `INSERT INTO password_reset_tokens
+        (id, user_id, token_hash, expires_at)
+       VALUES (?, ?, ?, ?)`,
+      [
+        randomUUID(),
+        user.id,
+        tokenHash,
+        expiresAt,
+      ]
+    );
+
+    try {
+      await sendPasswordResetEmail({
+        email: user.email,
+        name: user.name,
+        token,
+      });
+    } catch (error) {
+      console.error(
+        "Password-reset email delivery failed:",
+        error.message
+      );
+
+      // Invalidate the token if email delivery failed.
+      await query(
+        `UPDATE password_reset_tokens
+         SET used_at = CURRENT_TIMESTAMP
+         WHERE token_hash = ?
+           AND used_at IS NULL`,
+        [tokenHash]
+      );
+    }
+  }
+
+  return res.json({
+    message:
+      "If a verified account exists for this email, a password-reset link will be sent.",
+  });
+}
+
+
+ // POST /api/auth/reset-password
+export async function resetPassword(req, res) {
+  const { token, password } = req.body ?? {};
+
+  if (
+    typeof token !== "string" ||
+    token.length < 20 ||
+    token.length > 200
+  ) {
+    return res.status(400).json({
+      message: "A valid password-reset token is required.",
+    });
+  }
+
+  if (
+    typeof password !== "string" ||
+    password.length < 8 ||
+    Buffer.byteLength(password, "utf8") > 72
+  ) {
+    return res.status(400).json({
+      message:
+        "Password must be at least 8 characters and at most 72 UTF-8 bytes.",
+    });
+  }
+
+  const tokenHash = hashToken(token);
+
+  // Check before performing the relatively expensive bcrypt hash.
+  const matching = await query(
+    `SELECT id, expires_at, used_at
+     FROM password_reset_tokens
+     WHERE token_hash = ?
+     LIMIT 1`,
+    [tokenHash]
+  );
+
+  const record = matching[0];
+
+  if (!record || record.used_at) {
+    return res.status(400).json({
+      message: "This reset link is invalid or has already been used.",
+    });
+  }
+
+  if (Date.parse(record.expires_at) <= Date.now()) {
+    await query(
+      `UPDATE password_reset_tokens
+       SET used_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND used_at IS NULL`,
+      [record.id]
+    );
+
+    return res.status(400).json({
+      message: "This reset link has expired. Please request another.",
+    });
+  }
+
+  const passwordHash = await bcrypt.hash(password, 12);
+
+  const outcome = await withTransaction(async (txQuery) => {
+    // Recheck inside the transaction to prevent reusing a token.
+    const records = await txQuery(
+      `SELECT id, user_id, expires_at, used_at
+       FROM password_reset_tokens
+       WHERE token_hash = ?
+       LIMIT 1`,
+      [tokenHash]
+    );
+
+    const current = records[0];
+
+    if (
+      !current ||
+      current.used_at ||
+      Date.parse(current.expires_at) <= Date.now()
+    ) {
+      return { error: "invalid" };
+    }
+
+    const consumed = await txQuery(
+      `UPDATE password_reset_tokens
+       SET used_at = CURRENT_TIMESTAMP
+       WHERE id = ?
+         AND used_at IS NULL
+       RETURNING id`,
+      [current.id]
+    );
+
+    if (!consumed.length) {
+      return { error: "invalid" };
+    }
+
+    await txQuery(
+      `UPDATE users
+       SET password_hash = ?,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [passwordHash, current.user_id]
+    );
+
+    // Revoke all refresh sessions for this user.
+    await txQuery(
+      `UPDATE refresh_tokens
+       SET revoked_at =
+         COALESCE(revoked_at, CURRENT_TIMESTAMP)
+       WHERE user_id = ?`,
+      [current.user_id]
+    );
+
+    // Invalidate any other outstanding reset links.
+    await txQuery(
+      `UPDATE password_reset_tokens
+       SET used_at = COALESCE(used_at, CURRENT_TIMESTAMP)
+       WHERE user_id = ?`,
+      [current.user_id]
+    );
+
+    return { success: true };
+  });
+
+  if (outcome.error) {
+    return res.status(400).json({
+      message: "This reset link is invalid, expired, or already used.",
+    });
+  }
+
+  return res.json({
+    message:
+      "Password reset successfully. Please log in with your new password.",
   });
 }
